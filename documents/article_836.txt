@@ -1,0 +1,1 @@
+Articolo: HP pushes parity for Itanium, PA-RISC servers At its annual HP World user conference in Chicago this week, Hewlett-Packard Co. (HP) will announce a number of enhancements to its HP-UX operating system, designed to narrow the gap between the capabilities of the company's Integrity and HP 9000 servers.

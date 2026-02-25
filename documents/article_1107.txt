@@ -1,0 +1,1 @@
+Articolo: Fun With Web services! Forget those pesky business functions. To learn how Web services work and what you can do with them, check out these useful utilities that tell you who uttered that famous Shakespeare line, for example, or even convert Sao Tome dobras to Malawi kwacha.

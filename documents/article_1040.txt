@@ -1,0 +1,1 @@
+Articolo: Microsoft details XP SP2 conflicts Microsoft Corp. has published a list of nearly 50 applications and games that may not work correctly after installing Service Pack 2 (SP2) for Windows XP.

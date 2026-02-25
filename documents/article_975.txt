@@ -1,0 +1,1 @@
+Articolo: Sybase upgrades PowerBuilder, plots RFID move Sybase Inc. released a new version of its application development tool on Monday, called PowerBuilder 10, and outlined plans for an upgrade to its database software, Adaptive Server Enterprise, which will go into beta at the end of this month and is due for release next year.

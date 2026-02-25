@@ -1,0 +1,1 @@
+Articolo: AOL Releases Netscape 7.2 Also included with 7.2 is an improved pop-up blocker which now stops more pop-ups than any previous version of Netscape, something only just apparent in some more widely used browsers, Netscape will even block mouse over pop-ups. 

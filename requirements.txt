@@ -1,0 +1,12 @@
+numpy
+pandas
+sentence-transformers
+faiss-cpu
+transformers
+accelerate
+optimum
+onnx
+onnxruntime-directml
+streamlit
+python-docx
+pypdf2

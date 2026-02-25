@@ -1,0 +1,1 @@
+Articolo: Microsoft readies Host Integration Server 2004 In a continued effort to compete with IBM Corp. and its WebSphere offerings, Microsoft Corp. on Tuesday announced imminent availability of Host Integration Server 2004.
