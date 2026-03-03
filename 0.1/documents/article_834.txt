@@ -1,0 +1,1 @@
+Articolo: AccuRev touts software configuration management approach AccuRev on Monday will release an upgrade to its SCM (software configuration management) package that the company argues offers a superior alternative to file-based SCM systems.

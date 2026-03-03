@@ -1,68 +1,171 @@
-import pickle  # Per salvare oggetti Python su disco
-import os      # Per interagire con il sistema operativo (file, cartelle)
-from sentence_transformers import SentenceTransformer  # Modello per creare embedding
-import faiss   # Libreria per ricerca vettoriale veloce
-import numpy as np  # Per operazioni matematiche con array
-from PyPDF2 import PdfReader  # Legge file PDF
-import docx     # Legge file Word
+import os
+import math
+from collections import Counter
+#import numpy as np
+from PyPDF2 import PdfReader
+import docx
+
+
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct, SparseVector
+
+from tqdm import tqdm
 
 # --- Configurazione ---
-DOCUMENTS_DIR = "./documents"  # Cartella dove mettere i tuoi file .txt
-KNOWLEDGE_BASE_PKL = "knowledge_base.pkl"
-FAISS_INDEX = "documents_index.faiss"
-MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'  # Un buon modello per embedding
+DOCUMENTS_DIR = "./documents"
+MODEL_NAME = 'BAAI/bge-m3'
+QDRANT_URL      = "http://localhost:6333"
+COLLECTION_NAME = "knowledge_base"
 
-"""
-Questo script crea una knowledge base a partire da documenti testuali, salvando i chunk di testo (paragrafi) in una matrice e donando loro informazioni di contesto (nome del file, id del chunk). 
-il tutto viene salvato su disco per essere utilizzato successivamente.
-"""
+DENSE_VECTOR_NAME  = "dense"   
+SPARSE_VECTOR_NAME = "sparse"  
 
-# 1. Carica i documenti (qui assumiamo siano file .txt, ma puoi estendere con PyPDF2, etc.)
+
+# NOTE: SentenceTransformer does not support DirectML, so this script always runs on CPU.
+# This is fine — you only need to run this once to build the knowledge base.
+print("Running on CPU (SentenceTransformer does not support DirectML).")
+
+# ── 1. Carica il modello di embedding ────────────────────────────────────────────────────────
+print(f"Caricamento modello embedding: {MODEL_NAME}...")
+st_model = SentenceTransformer(MODEL_NAME, device="cpu", model_kwargs={"use_safetensors": True})
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+dense_dim = st_model.get_sentence_embedding_dimension()
+
+SPECIAL_IDS = {
+    tokenizer.pad_token_id,
+    tokenizer.unk_token_id,
+    tokenizer.cls_token_id,
+    tokenizer.sep_token_id,
+    tokenizer.bos_token_id,
+    tokenizer.eos_token_id,
+}
+SPECIAL_IDS.discard(None)
+
+print(f"Dimensione vettore denso: {dense_dim}")
+
+# ── 2. Carica i documenti ─────────────────────────────────────────────────────────────────
 def load_documents_from_directory(directory):
     documents = []
     for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+
         if filename.endswith(".txt"):
-            filepath = os.path.join(directory, filename)
             with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Dividi in chunk (es. per paragrafi o frasi)
-                chunks = content.split('\n\n')  # Dividi per doppi a capo
-                for i, chunk in enumerate(chunks):
-                    if chunk.strip():  # Salta chunk vuoti
-                        documents.append({
-                            'source': filename,
-                            'chunk_id': i,
-                            'text': chunk.strip()
-                        })
+                chunks = f.read().split('\n\n')
+
+        elif filename.endswith(".pdf"):
+            reader = PdfReader(filepath)
+            full_text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+            chunks = full_text.split('\n\n')
+
+        elif filename.endswith(".docx"):
+            doc = docx.Document(filepath)
+            full_text = "\n\n".join(p.text for p in doc.paragraphs)
+            chunks = full_text.split('\n\n')
+
+        else:
+            continue  # formato non supportato
+
+        for i, chunk in enumerate(chunks):
+            if chunk.strip():
+                documents.append({
+                    'source':   filename,
+                    'chunk_id': i,
+                    'text':     chunk.strip()
+                })
     return documents
 
 print("Caricamento documenti...")
 knowledge_base = load_documents_from_directory(DOCUMENTS_DIR)
 print(f"Caricati {len(knowledge_base)} chunk di documenti.")
 
-print(knowledge_base[:2])  # Stampa i primi 2 chunk per verifica
+# ── 3. Crea collezione Qdrant ────────────────────────────────────────────────────────────────
+client = QdrantClient(url=QDRANT_URL)
 
-# 2. Carica il modello di embedding
-print(f"Caricamento modello embedding: {MODEL_NAME}...")
-model = SentenceTransformer(MODEL_NAME)
+if client.collection_exists(collection_name=COLLECTION_NAME):
+    print(f"⚠️  Collection '{COLLECTION_NAME}' già esistente — la elimino e la ricreo.")
+    client.delete_collection(collection_name=COLLECTION_NAME)
 
-# 3. Crea gli embedding per tutti i chunk
-print("Creazione embedding...")
-texts = [item['text'] for item in knowledge_base]
-embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+print("Creazione collection Qdrant (dense + sparse)...")
+client.create_collection(
+    collection_name=COLLECTION_NAME,
+    # Vettori densi (cosine similarity)
+    vectors_config={
+        DENSE_VECTOR_NAME: VectorParams(size=dense_dim, distance=Distance.COSINE)
+    },
+    # Vettori sparsi (lexical/BM25-like da BGE-M3)
+    sparse_vectors_config={
+        SPARSE_VECTOR_NAME: SparseVectorParams(
+            index=SparseIndexParams(on_disk=False)  # tieni in RAM per velocità
+        )
+    }
+)
+print("Collection creata.")
 
-# 4. Normalizza gli embedding e crea l'indice FAISS (per similarità coseno)
-print("Creazione indice FAISS...")
-dimension = embeddings.shape[1]
-# Usiamo Inner Product, che diventa similarità coseno dopo la normalizzazione
-index = faiss.IndexFlatIP(dimension)
-faiss.normalize_L2(embeddings)  # Normalizza per usare cosine similarity
-index.add(embeddings.astype('float32'))
+# ── 4. encoding ───────────────────────────────────────────────────────────────────────────────
+print("Creazione embedding (dense + sparse) e preparazione punti...")
 
-# 5. Salva tutto su disco
-print("Salvataggio knowledge base e indice...")
-with open(KNOWLEDGE_BASE_PKL, 'wb') as f:
-    pickle.dump(knowledge_base, f)
-faiss.write_index(index, FAISS_INDEX)
+def get_dense_vector(text: str) -> list:
+    """Semantic dense embedding via SentenceTransformer (L2-normalized)."""
+    return st_model.encode(text, convert_to_numpy=True, normalize_embeddings=True).tolist()
 
-print("Fatto! Knowledge base pronto.")
+
+def get_sparse_vector(text: str) -> SparseVector:
+    """
+    Lexical sparse vector using the BGE-M3 tokenizer.
+    Each unique token -> weight = log(1 + term_frequency).
+    This pairs naturally with Qdrant sparse dot-product scoring.
+    """
+    token_ids = tokenizer(
+        text,
+        truncation=True,
+        max_length=8192,
+        add_special_tokens=False
+    )["input_ids"]
+
+    tf = Counter(token_ids)
+    indices, values = [], []
+    for token_id, count in tf.items():
+        if token_id not in SPECIAL_IDS:
+            indices.append(token_id)
+            values.append(math.log1p(count))
+
+    return SparseVector(indices=indices, values=values)
+
+
+def encode_text(text: str):
+    return get_dense_vector(text), get_sparse_vector(text)
+
+
+print("Creazione embedding (dense + sparse) e preparazione punti...")
+points = []
+for i, item in enumerate(tqdm(knowledge_base, desc="Encoding documents")):
+    dense_vec, sparse_vec = encode_text(item['text'])
+    points.append(
+        PointStruct(
+            id=i,
+            vector={
+                DENSE_VECTOR_NAME:  dense_vec,
+                SPARSE_VECTOR_NAME: sparse_vec,
+            },
+            payload={
+                "source":   item['source'],
+                "chunk_id": item['chunk_id'],
+                "text":     item['text']
+            }
+        )
+    )
+
+# ── 5. Upsert in Qdrant ────────────────────────────────────────────────────────────────────────   
+def upsert_in_batches(client, collection_name, points, batch_size=50):
+    with tqdm(total=len(points), desc="Uploading to Qdrant") as pbar:
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i+batch_size]
+            client.upsert(collection_name=collection_name, points=batch)
+            pbar.update(len(batch))
+
+upsert_in_batches(client, "knowledge_base", points)
+print(f"✅ Inseriti {len(points)} punti in Qdrant. Knowledge base pronta!")

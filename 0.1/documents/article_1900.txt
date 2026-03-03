@@ -1,0 +1,1 @@
+Articolo: Microsoft readies Host Integration Server 2004 The newest edition of Host Integration Server, which replaces the 2000 version, is designed to make it easier for users to link Windows systems with IBM mainframes and midrange iSeries servers.

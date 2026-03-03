@@ -1,0 +1,1 @@
+Articolo: Microsoft details conflicts in new XP update Microsoft has published a list of nearly 50 applications -- including developer and backup tools, antivirus software and an FTP client -- that may not work correctly after installing Service Pack 2 for Windows XP.

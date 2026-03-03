@@ -1,0 +1,1 @@
+Articolo: Sender ID gains traction Leading ISPs, anti-spam vendors, and e-mail software companies are moving quickly to add support for the Microsoft-backed anti-spam technology standard Sender ID, even as some e-mail experts raise doubts that the technology will work.

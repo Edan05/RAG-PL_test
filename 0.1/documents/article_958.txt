@@ -1,0 +1,1 @@
+Articolo: Rough patches for Microsoft's SP2 Windows update doesn't play well with all applications, even Redmond's. Also: CNET Reviews on security work still to be done.

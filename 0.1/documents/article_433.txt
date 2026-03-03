@@ -1,0 +1,1 @@
+Articolo: Infocus: Deploying Network Access Quarantine Control, Part 1 This article discusses Network Access Quarantine Control with Windows Server 2003, which allows administrators to quarantine mobile users before giving them full network access, by first ensuring these machines are up-to-date according to a baseline security model.

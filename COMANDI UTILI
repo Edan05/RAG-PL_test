@@ -1,0 +1,8 @@
+AVVIARE VIRTUAL ENVIRONMENT (.venv) IMPOSTANDO VARIABILI D'AMBIENTE
+
+$env:VIRTUAL_ENV = "C:\Users\edann\rag_project\.venv"
+$env:PATH = "$env:VIRTUAL_ENV\Scripts;" + $env:PATH
+
+AVVIA QDRANT
+
+docker run -p 6333:6333 -v $pwd/path/to/data:/qdrant/storage qdrant/qdrant
