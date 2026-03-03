@@ -1,5 +1,6 @@
 # RAG-PL_test
-
+the pipeline uses qwen3-4b-instruct-2507 as the LLM and BAAI/bge-m3 as the encoder
+#
 The LLM now runs on AMD gpu (if compatible with directml).
 
 I recommend creating a .venv (virtual environment) before installing requirements and running the code
