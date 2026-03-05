@@ -182,11 +182,11 @@ while True:
             history_context += f"User question: {prev_q}\nAssistant answer: {prev_a}\n\n"
         history_context += "---\n\n"
     
-    prompt = f"""Use the following document fragments to answer the question in the language it's written in.
+    prompt = f"""Use the following document fragments to answer the question in the language it's written in. Do not explain why you used x language, just answer in that language.
 If the question is not related to the provided documents, answer based on your general knowledge. Always try to use the provided documents if they are relevant.
 If you don't know the answer, just say you don't know, without making anything up. Keep your answer below 500 tokens.
 If you fall back to your general knowledge, please specify that in your answer.
-If you loop or get stuck, just say you got stuck and end the answer.
+If AND ONLY IF you loop or get stuck, just say you got stuck and end the answer.
 
 {history_context}Context:
 {context}

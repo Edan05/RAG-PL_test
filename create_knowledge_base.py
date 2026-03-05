@@ -106,18 +106,18 @@ client.create_collection(
 print("Collection creata.")
 
 # ── 4. encoding ───────────────────────────────────────────────────────────────────────────────
-print("Creazione embedding (dense + sparse) e preparazione punti...")
+print("Creazione embedding (dense + sparse)...")
 
 def get_dense_vector(text: str) -> list:
-    """Semantic dense embedding via SentenceTransformer (L2-normalized)."""
+    """Restituisce il vettore denso normalizzato per il testo dato."""
     return st_model.encode(text, convert_to_numpy=True, normalize_embeddings=True).tolist()
 
 
 def get_sparse_vector(text: str) -> SparseVector:
     """
-    Lexical sparse vector using the BGE-M3 tokenizer.
-    Each unique token -> weight = log(1 + term_frequency).
-    This pairs naturally with Qdrant sparse dot-product scoring.
+    Tokenizza il testo e costruisce un vettore sparso basato sulla frequenza dei token.
+    I token speciali (pad, unk, cls, sep, bos, eos) vengono ignorati.
+    il peso di ogni token è calcolato come log(1 + frequenza), dove la frequenza è il numero di volte che il token appare nel testo.
     """
     token_ids = tokenizer(
         text,
@@ -139,8 +139,6 @@ def get_sparse_vector(text: str) -> SparseVector:
 def encode_text(text: str):
     return get_dense_vector(text), get_sparse_vector(text)
 
-
-print("Creazione embedding (dense + sparse) e preparazione punti...")
 points = []
 for i, item in enumerate(tqdm(knowledge_base, desc="Encoding documents")):
     dense_vec, sparse_vec = encode_text(item['text'])
