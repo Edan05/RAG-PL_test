@@ -23,6 +23,10 @@ COLLECTION_NAME = "knowledge_base"
 DENSE_VECTOR_NAME  = "dense"   
 SPARSE_VECTOR_NAME = "sparse"  
 
+# --- Chunking config ---
+CHUNK_SIZE    = 500   # max characters per chunk
+CHUNK_OVERLAP = 100   # overlap between consecutive chunks
+
 
 # NOTE: SentenceTransformer does not support DirectML, so this script always runs on CPU.
 # This is fine — you only need to run this once to build the knowledge base.
@@ -34,50 +38,91 @@ st_model = SentenceTransformer(MODEL_NAME, device="cpu", model_kwargs={"use_safe
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 dense_dim = st_model.get_sentence_embedding_dimension()
 
-SPECIAL_IDS = {
-    tokenizer.pad_token_id,
-    tokenizer.unk_token_id,
-    tokenizer.cls_token_id,
-    tokenizer.sep_token_id,
-    tokenizer.bos_token_id,
-    tokenizer.eos_token_id,
-}
+SPECIAL_IDS = {             # Questi ID speciali non devono essere inclusi nel vettore sparso, altrimenti distorcono la rappresentazione.
+    tokenizer.pad_token_id,       # ID del token di padding (usato per allineare le sequenze)
+    tokenizer.unk_token_id,       # ID del token "unknown" (usato per parole fuori vocabolario)
+    tokenizer.cls_token_id,       # ID del token "classificazione" (usato in alcuni modelli per indicare l'inizio della sequenza)
+    tokenizer.sep_token_id,       # ID del token "separatore" (usato per separare le sequenze)
+    tokenizer.bos_token_id,       # ID del token "inizio della sequenza" (usato in alcuni modelli, come GPT, per indicare l'inizio del testo)
+    tokenizer.eos_token_id,       # ID del token "fine della sequenza" (usato in alcuni modelli, come GPT, per indicare la fine del testo)
+}                           # questi id non portano informazioni semantiche utili, quindi è meglio escluderli dal vettore sparso.
 SPECIAL_IDS.discard(None)
 
 print(f"Dimensione vettore denso: {dense_dim}")
+
+# ── 2. Chunker ────────────────────────────────────────────────────────────────────────────────
+def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """
+    Splits text into chunks of at most `chunk_size` characters, with `overlap`
+    characters of context carried over from the previous chunk.
+ 
+    Strategy:
+      1. Try to split on sentence boundaries ('. ', '? ', '! ') to avoid
+         cutting mid-sentence whenever possible.
+      2. Fall back to a hard character split only when no boundary is found.
+    """
+    chunks = []
+    start = 0
+    text_len = len(text)
+ 
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+ 
+        # If we're not at the very end, try to find a sentence boundary
+        # within the last 20 % of the window so we don't cut mid-sentence.
+        if end < text_len:
+            search_from = start + int(chunk_size * 0.8)
+            best_boundary = -1
+            for sep in ('. ', '? ', '! ', '\n'):
+                pos = text.rfind(sep, search_from, end)
+                if pos != -1 and pos > best_boundary:
+                    best_boundary = pos + len(sep)   # include the separator in the chunk
+ 
+            if best_boundary != -1:
+                end = best_boundary
+ 
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+ 
+        # Move forward, stepping back by `overlap` to preserve context
+        start = end - overlap if end - overlap > start else end
+ 
+    return chunks
+ 
+
 
 # ── 2. Carica i documenti ─────────────────────────────────────────────────────────────────
 def load_documents_from_directory(directory):
     documents = []
     for filename in os.listdir(directory):
         filepath = os.path.join(directory, filename)
-
+ 
         if filename.endswith(".txt"):
             with open(filepath, 'r', encoding='utf-8') as f:
-                chunks = f.read().split('\n\n')
-
+                raw_text = f.read()
+ 
         elif filename.endswith(".pdf"):
             reader = PdfReader(filepath)
-            full_text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
-            chunks = full_text.split('\n\n')
-
+            raw_text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+ 
         elif filename.endswith(".docx"):
             doc = docx.Document(filepath)
-            full_text = "\n\n".join(p.text for p in doc.paragraphs)
-            chunks = full_text.split('\n\n')
-
+            raw_text = "\n\n".join(p.text for p in doc.paragraphs)
+ 
         else:
             continue  # formato non supportato
-
+ 
+        chunks = split_into_chunks(raw_text)
         for i, chunk in enumerate(chunks):
-            if chunk.strip():
-                documents.append({
-                    'source':   filename,
-                    'chunk_id': i,
-                    'text':     chunk.strip()
-                })
+            documents.append({
+                'source':   filename,
+                'chunk_id': i,
+                'text':     chunk
+            })
+ 
     return documents
-
+ 
 print("Caricamento documenti...")
 knowledge_base = load_documents_from_directory(DOCUMENTS_DIR)
 print(f"Caricati {len(knowledge_base)} chunk di documenti.")
@@ -126,12 +171,12 @@ def get_sparse_vector(text: str) -> SparseVector:
         add_special_tokens=False
     )["input_ids"]
 
-    tf = Counter(token_ids)
+    tf = Counter(token_ids)  #un dizionario che mappa ogni token alla sua frequenza nel testo. Esempio: {101: 3, 102: 1, 103: 2} 101 appare 3 volte, 102 appare 1 volta, 103 appare 2 volte.
     indices, values = [], []
     for token_id, count in tf.items():
         if token_id not in SPECIAL_IDS:
             indices.append(token_id)
-            values.append(math.log1p(count))
+            values.append(math.log1p(count))   #log1p = log(1+x) per punteggio assegnato ai token
 
     return SparseVector(indices=indices, values=values)
 
@@ -165,5 +210,5 @@ def upsert_in_batches(client, collection_name, points, batch_size=50):
             client.upsert(collection_name=collection_name, points=batch)
             pbar.update(len(batch))
 
-upsert_in_batches(client, "knowledge_base", points)
+upsert_in_batches(client, "knowledge_base", points) 
 print(f"✅ Inseriti {len(points)} punti in Qdrant. Knowledge base pronta!")

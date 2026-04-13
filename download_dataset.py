@@ -1,20 +1,21 @@
 from datasets import load_dataset
 import os
-import json
 
-# 1. Dataset di articoli news(perfetto per RAG)
-print("Scaricamento dataset news...")
-ds = load_dataset("ag_news", split="train")  # Carica il dataset intero dal training set
-print(f"Dataset caricato con {len(ds)} articoli.")
-# Limita a 2000 elementi per il processing
-ds = ds.select(range(min(2000, len(ds))))
+# CNN/DailyMail has full news articles — much better for RAG testing
+print("Downloading full news articles...")
+ds = load_dataset("cnn_dailymail", "3.0.0", split="train")
+ds = ds.select(range(200))
+print(f"Loaded {len(ds)} articles.")
 
-# 2. Salva i documenti in una cartella (txt per testare)
 DOCUMENTS_DIR = "./documents"
-# Crea la cartella documents se non esiste
-os.makedirs("./documents", exist_ok=True)
-for i, paper in enumerate(ds):
-    filename = f"./documents/article_{i}.txt"
+os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+
+for i, article in enumerate(ds):
+    filename = f"{DOCUMENTS_DIR}/article_{i}.txt"
     with open(filename, 'w', encoding='utf-8') as f:
-        f.write(f"Articolo: {paper['text']}\n")
-    print(f"Salvato: {filename}")
+        # Write headline-style marker + full article body
+        f.write(f"URL: {article['id']}\n\n")
+        f.write(article['article'])
+    print(f"Saved: {filename}")
+
+print(f"\nDone! {len(ds)} full articles saved to {DOCUMENTS_DIR}/")
