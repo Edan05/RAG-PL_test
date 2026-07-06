@@ -1,59 +1,49 @@
-import math
-from collections import Counter
-
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, pipeline
-from sentence_transformers import SentenceTransformer
-
+import numpy as np
+import onnxruntime_genai as og
+ 
+from FlagEmbedding import BGEM3FlagModel
+from sentence_transformers import CrossEncoder
+ 
 from qdrant_client import QdrantClient
 from qdrant_client.models import SparseVector, Prefetch, FusionQuery, Fusion
 import torch
 
+
 # --- Configurazione ---
 EMBEDDING_MODEL_NAME = 'BAAI/bge-m3'
+RERANKER_MODEL_NAME  = "BAAI/bge-reranker-v2-m3" #cross encoder reranker
 GENERATOR_MODEL_ID   = "Qwen/Qwen3-4B-Instruct-2507"
 ROUTER_MODEL_ID    = "Qwen/Qwen3-0.6B"
 
 qdrant_url           = "http://localhost:6333"
 collection_name      = "knowledge_base"
-TOP_K                = 5
+TOP_K                = 5 
+FETCH_K              = 20  # quanti risultati da prefetchare da Qdrant prima di rerankare e ridurre a TOP_K
 
 DENSE_VECTOR_NAME  = "dense"
 SPARSE_VECTOR_NAME = "sparse"
 
 # --- Device Detection ---
-use_dml = False
-dml_device = None
-
+# Paths to the exported ONNX models (output of onnxruntime-genai builder)
 if torch.cuda.is_available():
-    device = torch.device("cuda")
+    GENERATOR_ONNX_PATH = "./qwen_gen_onnx_cuda"
+    ROUTER_ONNX_PATH    = "./qwen_router_onnx_cuda"
+    LLM_DEVICE = "CUDA"
+    bge_fp16 = True
     print(f"✅ CUDA GPU detected: {torch.cuda.get_device_name(0)}")
+
 else:
-    try:
-        import torch_directml
-        dml_device = torch_directml.device()
-        use_dml = True
-        device = dml_device
-        print(f"✅ DirectML GPU detected: {torch_directml.device_name(0)}")
-    except Exception as e:
-        device = torch.device("cpu")
-        print(f"⚠️  DirectML not available ({e}), falling back to CPU.")
+    GENERATOR_ONNX_PATH = "./qwen_gen_onnx_dml"
+    ROUTER_ONNX_PATH    = "./qwen_router_onnx_dml"
+    LLM_DEVICE = "DirectML"
+    bge_fp16 = False
+    print("ℹ️  No CUDA GPU detected. BGE-M3 and reranker will use CPU fp32.")
+
 
 # 1. ── Carica il modello di embedding ────────────────────────────────────────────────────────
 
 print("caricamento modello di embedding...")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu", model_kwargs={"use_safetensors": True})
-tokenizer_emb = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
-
-SPECIAL_IDS = {
-    tokenizer_emb.pad_token_id,
-    tokenizer_emb.unk_token_id,
-    tokenizer_emb.cls_token_id,
-    tokenizer_emb.sep_token_id,
-    tokenizer_emb.bos_token_id,
-    tokenizer_emb.eos_token_id,
-}
-
-SPECIAL_IDS.discard(None)
+bge_model = BGEM3FlagModel(EMBEDDING_MODEL_NAME, use_fp16=bge_fp16, device="cpu")
 
 # 2. ── Connessione a Qdrant ────────────────────────────────────────────────────────────────
 print(f"connessione a Qdrant su {qdrant_url}...")
@@ -61,161 +51,194 @@ qdrant_client = QdrantClient(url=qdrant_url)
 
 # 3. ── Funzioni di encoding della query ────────────────────────────────────────────────────────
 
-#vettore denso della query
-def get_dense_vector(text: str) -> list:
-    return embedding_model.encode(text, convert_to_numpy=True, normalize_embeddings=True).tolist()
+def encode_query(text: str) -> list[float]:
+    output = bge_model.encode(
+        [text],
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False,
+    )
+    lw = output["lexical_weights"][0]
+    dense = output["dense_vecs"][0].tolist()
+    sparse = SparseVector(
+        indices=list(lw.keys()),
+        values=[float(v) for v in lw.values()]
+    )
+    return dense, sparse
+
+# 4. ── Carica il reranker BGE ───────────────────────────────────────────────────────────────
+
+print(f"Caricamento reranker {RERANKER_MODEL_NAME}...")
+reranker = CrossEncoder(
+    RERANKER_MODEL_NAME,
+    device="cpu",
+    automodel_args={"torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32},
+)
 
 
-#vettore sparso della query
-def get_sparse_vector(text: str) -> SparseVector:
-    token_ids = tokenizer_emb(
-        text,
-        truncation=True,
-        max_length=8192,
-        add_special_tokens=False
-    )["input_ids"]
-    tf = Counter(token_ids)
-    indices, values = [], []
-    for token_id, count in tf.items():
-        if token_id not in SPECIAL_IDS:
-            indices.append(token_id)
-            values.append(math.log1p(count))
-    return SparseVector(indices=indices, values=values)
+# 5. ── Funzione di ricerca in Qdrant ───────────────────────────────────────────────────────────────
 
-# 4. ── Funzione di ricerca in Qdrant ───────────────────────────────────────────────────────────────
-
-def retrieve(query: str, k: int = TOP_K) -> list:
-    """Hybrid retrieval: dense cosine + sparse lexical, fused with Reciprocal Rank Fusion."""
-    dense = get_dense_vector(query)
-    sparse = get_sparse_vector(query)
-
+def retrieve(query: str, top_k: int = TOP_K, fetch_k: int = FETCH_K) -> list[dict]:
+    """
+    1. Hybrid retrieval from Qdrant (dense cosine + BGE-M3 sparse, fused with RRF).
+       Fetches `fetch_k` candidates — more than we need so the reranker has
+       enough material to work with.
+    2. Reranks all candidates with BGE-reranker-v2-m3 (cross-encoder).
+    3. Returns the best `top_k` chunks sorted by reranker score.
+    """
+    dense, sparse = encode_query(query)
+ 
     results = qdrant_client.query_points(
         collection_name=collection_name,
         prefetch=[
-            Prefetch(
-                query=dense,
-                using=DENSE_VECTOR_NAME,
-                limit=k * 2
-            ),
-            Prefetch(
-                query=sparse,
-                using=SPARSE_VECTOR_NAME,
-                limit=k * 2
-            ),
+            Prefetch(query=dense,  using=DENSE_VECTOR_NAME,  limit=fetch_k),
+            Prefetch(query=sparse, using=SPARSE_VECTOR_NAME, limit=fetch_k),
         ],
         query=FusionQuery(fusion=Fusion.RRF),
-        limit=k
+        limit=fetch_k,
     )
-
-    return [
+ 
+    candidates = [
         {
             "source":   r.payload["source"],
             "chunk_id": r.payload["chunk_id"],
             "text":     r.payload["text"],
-            "score":    r.score
+            "rrf_score": r.score,
         }
         for r in results.points
     ]
+ 
+    if not candidates:
+        return []
+ 
+    # Cross-encoder reranking ─────────────────────────────────────────────────
+    pairs         = [[query, c["text"]] for c in candidates]
+    raw_scores     = reranker.predict(pairs, convert_to_numpy=True)
+    rerank_scores = (1 / (1 + np.exp(-raw_scores))).tolist()  # sigmoid → [0, 1]
+ 
+    for chunk, score in zip(candidates, rerank_scores):
+        chunk["rerank_score"] = float(score)
+ 
+    reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:top_k]
 
-# 5. ── Carica il modelli generativi (Router e LLM) ───────────────────────────────────────────────────────────────
-print(f"Caricamento modello generativo {GENERATOR_MODEL_ID}...")
 
-generator = pipeline(
-    "text-generation",
-    model=GENERATOR_MODEL_ID,
-    dtype=torch.float16,
-    device=device
-)
+# 6. ── Carica il modelli generativi (Router e LLM) ───────────────────────────────────────────────────────────────
+"""
+og.Model loads the exported ONNX model and routes execution to DirectML.
+"""
 
-if generator.tokenizer.pad_token is None:
-    generator.tokenizer.pad_token = generator.tokenizer.eos_token
+print(f"Caricamento modello generativo da {GENERATOR_ONNX_PATH}...")
+gen_model     = og.Model(GENERATOR_ONNX_PATH)
+gen_tokenizer = og.Tokenizer(gen_model)
+print("Modello generativo caricato.")
+ 
+print(f"Caricamento modello router da {ROUTER_ONNX_PATH}...")
+router_model  = og.Model(ROUTER_ONNX_PATH)
+router_tok    = og.Tokenizer(router_model)
+print("Modello router caricato.")
+ 
+# tokenizzo ogni prompt per gli llm
+def _encode_messages(messages: list[dict], og_tokenizer) -> list[int]:
+    prompt = ""
+    for msg in messages:
+        role    = msg["role"]
+        content = msg["content"]
 
-print(f"Modello generativo caricato su {device}.")
+        prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
 
-print(f"Caricamento modello router {ROUTER_MODEL_ID}...")
-router = pipeline(
-    "text-generation",
-    model=ROUTER_MODEL_ID,
-    dtype=torch.float16,
-    device=device
-)
-if router.tokenizer.pad_token is None:
-    router.tokenizer.pad_token = router.tokenizer.eos_token
-print(f"Modello router caricato su {device}.")
+    prompt += "<|im_start|>assistant\n"
+    return og_tokenizer.encode(prompt)
 
-# 6. ── Routing ────────────────────────────────────────────────────────────────
-ROUTER_SYSTEM_PROMPT = """You are a query classifier. You must respond with EXACTLY one word, nothing else.
 
-Classify the user query into one of these two categories:
-- RETRIEVAL: questions about specific facts, documents, data, or knowledge that requires looking up information
-- GENERATIVE: general conversation, creative tasks, or questions answerable from common knowledge
 
-Rules:
-- Output ONLY the single word: RETRIEVAL or GENERATIVE
-- No punctuation, no explanation, no other words
-- If unsure, output RETRIEVAL
-- If asked about files or documents in a database output RETRIEVAL
+# 7. ── Routing ────────────────────────────────────────────────────────────────
+ROUTER_SYSTEM_PROMPT = """You are a classifier. Answer with a single word only: YES or NO.
+
+Is this query a question about specific files, documents, or records stored in a private database?
+
+NO  = general knowledge, conversation, math, cooking, history, science, creative tasks, greetings
+YES = explicitly asks about specific stored documents, contracts, reports, or database content
+
+Output ONLY the word YES or NO. Nothing else.
 
 Examples:
-Query: "do you have files about politics in the database?" → RETRIEVAL
-Query: "What does the contract say about termination?" → RETRIEVAL
-Query: "What is the capital of France?" → GENERATIVE
-Query: "Summarize the Q3 report" → RETRIEVAL
-Query: "Write me a poem" → GENERATIVE
-Query: "What are the product specifications?" → RETRIEVAL
-Query: "How do I bake a cake?" → GENERATIVE
-Query: "What can you tell me about the american economic policy?" → RETRIEVAL
-Query: "What is 2+2?" → GENERATIVE
-"""
+"ciao" → NO
+"come faccio una torta?" → NO
+"what is 2+2?" → NO
+"what is the capital of France?" → NO
+"write me a poem" → NO
+"what does the contract say about termination?" → YES
+"summarize the Q3 report" → YES
+"do you have files about X in the database?" → YES
+"what are the product specifications in the document?" → YES"""
 
 def route_query(query: str, retries: int = 5) -> str:
     """Route query to retrieval or generative pipeline."""
     messages = [
         {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-        {"role": "user", "content": f"/no_think\Query: {query}"}
+        {"role": "user",   "content": f"Query: {query}"}
     ]
-    
+
+    input_tokens = _encode_messages(messages, router_tok)
+
     for attempt in range(retries):
-        response = router(
-            messages,
-            max_new_tokens=20,       # one word needs at most 2-3 tokens, 5 is safe headroom
-            do_sample=False,        # greedy decoding — you want determinism, not creativity
-            temperature=None,       # must be None when do_sample=False
-            top_p=None,             # same
-            pad_token_id=router.tokenizer.pad_token_id
+        # posso settare i parametri di generazione usando og.GeneratorParams e .set_search_options, ad esempio per limitare la lunghezza massima o forzare temperature basse per output più deterministici
+        params = og.GeneratorParams(router_model)
+        params.set_search_options(
+            max_length=len(input_tokens) + 250,  # just a few tokens for the answer
+            do_sample=True,   #not deterministic, to allow some variability in the output and gives room for retries if the format isn't correct
+            temperature=0.1,  # almost deterministic output
         )
-        
-        # extract only the new assistant text, not the prompt
-        answer = response[0]['generated_text'][-1]['content'].strip().upper()
 
-        print(f"Router attempt {attempt+1}: '{answer}'")
-        
-        if "RETRIEVAL" in answer:
+        gen_runner = og.Generator(router_model, params)
+        gen_runner.append_tokens(input_tokens)   # ← feed tokens here
+
+        answer_tokens = []
+        # questo while loop genera un token alla volta e lo mette in answer tokens. (autoregressive decoding, default per i modelli di linguaggio)
+        while not gen_runner.is_done():
+            gen_runner.generate_next_token()
+            new_token = gen_runner.get_next_tokens()[0]
+            answer_tokens.append(new_token)
+
+        answer_raw = router_tok.decode(answer_tokens).strip()
+
+        #DEBUG: print raw router output for inspection
+        print(f"Router attempt {attempt+1}: '{answer_raw}'")
+
+        # Extract only what comes after </think> if present, to allow the model to "think" before answering
+        if "</think>" in answer_raw:
+            answer = answer_raw.split("</think>")[-1].strip().upper()
+        else:
+            continue # if the expected format isn't met, retry
+
+        if "YES" in answer:
             return "retrieval"
-        elif "GENERATIVE" in answer:
+        elif "NO" in answer:
             return "generative"
-        # if neither matched, retry
-    
-    print(f"⚠️  Router non ha classificato la query dopo {retries} tentativi, usando retrieval come fallback.")
-    return "retrieval"  # safe default: better to retrieve unnecessarily than to skip it
 
-# 7. ── propts generatore ───────────────────────────────────────────────────────────────
-GENERATOR_SYSTEM_PROMPT_RETRIEVAL = """/no_think
-You are a helpful assistant that answers questions based on provided document fragments.
+    print(f"⚠️  Router non ha classificato la query dopo {retries} tentativi, usando retrieval come fallback.")
+    return "retrieval"  # meglio fare retrieval se il router fallisce
+
+
+
+# 8. ── prompt generatore ───────────────────────────────────────────────────────────────
+GENERATOR_SYSTEM_PROMPT_RETRIEVAL = """You are a helpful assistant that answers questions based on provided document fragments.
 Rules:
-- Always answer in the same language as the question, without explaining why
+- Always answer in the same language the user is using, without explaining why
 - Use the provided context if relevant
-- If the context is not relevant, answer from general knowledge and explicitly say so
-- If you don't know, say you don't know — never make anything up
+- If the context is not relevant to the question, ignore it and answer from your general knowledge, explicitly stating that the provided documents were not relevant
+- Only say you don't know if BOTH the context and your general knowledge cannot answer the question
 - Keep answers under 500 tokens"""
 
-GENERATOR_SYSTEM_PROMPT_GENERATIVE = """/no_think
-You are a helpful assistant.
+GENERATOR_SYSTEM_PROMPT_GENERATIVE = """You are a helpful assistant.
 Rules:
-- Always answer in the same language as the question, without explaining why
+- Always answer in the same language the user is using, without explaining why
 - Answer from your general knowledge
 - If you don't know, say you don't know — never make anything up
 - Keep answers under 500 tokens"""
+
+MAX_HISTORY_EXCHANGES = 5
 
 def build_messages(query: str, conversation_history: list, context: str = None) -> list:
     # pick the right system prompt depending on whether we have context
@@ -235,9 +258,8 @@ def build_messages(query: str, conversation_history: list, context: str = None) 
 
     return messages
 
-# 8. ── Loop interattivo ───────────────────────────────────────────────────────────────
+# 9. ── Loop interattivo ───────────────────────────────────────────────────────────────
 conversation_history = []
-MAX_HISTORY_EXCHANGES = 5
 
 print("\n" + "="*60)
 print(f"RAG Pipeline pronta!")
@@ -273,28 +295,51 @@ while True:
     context = None
     if route == "retrieval":
         print("🔍 Ricerca documenti...")
-        retrieved_chunks = retrieve(query, k=TOP_K)
+        retrieved_chunks = retrieve(query, top_k=TOP_K, fetch_k=FETCH_K)
         context = "\n\n".join([f"From {r['source']}: {r['text']}" for r in retrieved_chunks])
 
-    # --- Build messages and generate ---
-    print("✍️  Generazione risposta...")
-    messages  = build_messages(query, conversation_history, context)
-    responses = generator(
-        messages,
-        max_new_tokens=500,
-        do_sample=True,
-        temperature=0.7,
-        pad_token_id=generator.tokenizer.pad_token_id
-    )
-    answer = responses[0]['generated_text'][-1]['content'].strip()
+    # --- Build messages and generate (streaming)---
 
+    print("✍️  Generazione risposta...")
+    messages     = build_messages(query, conversation_history, context)
+    input_tokens = _encode_messages(messages, gen_tokenizer)
+
+
+    #DEBUG: print prompt for inspection #################################################################################
+    """
+    prompt_check = ""
+    for m in messages:
+        prompt_check += f"\n[{m['role'].upper()}]: {m['content'][:20000]}"
+    print(f"prompt_check", prompt_check[:5000], "..." if len(prompt_check) > 5000 else "")
+    """
+    params = og.GeneratorParams(gen_model)
+    params.set_search_options(
+        max_length=len(input_tokens) + 512,  # allow up to 512 tokens for the answer
+        temperature=0.7,
+        do_sample=True,
+    )
+ 
+    gen_runner    = og.Generator(gen_model, params)
+    gen_runner.append_tokens(input_tokens)
+    answer_tokens = []
+    
+    # end="" rimuove la newline dal print (print() ha /n di default) e flush=true forza la stampa immediata, senza passare per la memoria intermedia(evita ritardi nello streaming e blocchi di testo)
+    print("\n💬 ", end="", flush=True)
+    # la differenza tra questo while loop e quello del router è che decodo ogni token appena generato e lo printo immediatamente per attivare lo streaming.
+    while not gen_runner.is_done():
+        gen_runner.generate_next_token()
+        new_token  = gen_runner.get_next_tokens()[0]
+        token_text = gen_tokenizer.decode([new_token])
+        print(token_text, end="", flush=True)
+        answer_tokens.append(token_text)
+ 
+    print()
+    answer = "".join(answer_tokens).strip()
+ 
     # --- Store and display ---
     conversation_history.append((query, answer))
-    print(f"\n💬 {answer}")
-
+ 
     if route == "retrieval":
         print("\n--- FONTI USATE ---")
         for r in retrieved_chunks:
             print(f"- {r['source']} (chunk {r['chunk_id']}): {r['text'][:100]}...")
-
-
